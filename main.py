@@ -124,10 +124,11 @@ def main():
 
     suffix_link = soup.find('a', text=re.compile(r'Doc', re.IGNORECASE))['href']
     download_link = f'https://www.mass.gov{suffix_link}'
-    filename = re.search(r'[^-]*-[^-]*-[^-]*/download', download_link).group()[0:-9]
+    filename = re.search(r'([^-]*-[^-]*-[^-]*)-[^-]*/download', download_link).group(1)
     filename = filename.replace('-', '_')
+
     docx_mount_filepath = f'{mount_path}{filename}.docx'
-    docx_filepath = f'{filename}.docx'
+    docx_filepath = f'downloaded/{filename}.docx'
 
     try:
         urllib.request.urlretrieve(download_link, docx_mount_filepath)
@@ -192,7 +193,7 @@ def main():
         df.loc[df['City_Town'] == k, 'City_Town'] = v
 
     # Save the table (known COVID19 cases per city/town) locally
-    df.to_csv(f'{filename}.csv',
+    df.to_csv(f'processed/{filename}.csv',
               index=False)
 
     print(f'{filename}.csv saved locally!')
@@ -225,7 +226,7 @@ def main():
     dashboard_filename = dashboard_filename.replace('-', '_')
     age_filename = dashboard_filename.replace('dashboard', 'age')
     dashboard_pdf_mount_filepath = f'{mount_path}{dashboard_filename}.pdf'
-    dashboard_pdf_filepath = f'{dashboard_filename}.pdf'
+    dashboard_pdf_filepath = f'downloaded/{dashboard_filename}.pdf'
 
     try:
         urllib.request.urlretrieve(dashboard_download_link, dashboard_pdf_mount_filepath)
@@ -238,7 +239,7 @@ def main():
     age_df = construct_age_df_from_text(text=dashboard_text)
 
     # save it locally
-    age_df.to_csv(f'{age_filename}.csv',
+    age_df.to_csv(f'processed/{age_filename}.csv',
                   index=False)
 
     
