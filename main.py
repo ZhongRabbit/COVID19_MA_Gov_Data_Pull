@@ -134,7 +134,7 @@ def main():
         urllib.request.urlretrieve(download_link, docx_mount_filepath)
         print(f'Downloaded from {download_link} to {docx_mount_filepath}!')
     except FileNotFoundError:
-        print('{docx_mount_filepath} does not exist! Save locally instead as {docx_filepath}!')
+        print(f'{docx_mount_filepath} does not exist! Save locally instead as {docx_filepath}!')
         urllib.request.urlretrieve(download_link, docx_filepath)
         
     # fetch all tables
