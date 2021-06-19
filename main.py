@@ -1,17 +1,10 @@
 # This file can be used in conjunction w/ a Docker container on Airflow to schedule daily data pulling from 
 # https://www.mass.gov/info-details/covid-19-cases-quarantine-and-monitoring. Most data updates occur daily at 4pm.
 # The known COVID19 cases by city/town are updated every Wednesday @ 4pm.
-# This code will download, process & save the data locally as a failsafe.
+# This code will download, process & save the data locally as a failsafe. Additionally, it'll attempt to load the 
+# result as BigQuery tables under "upload_bq_project.upload_bq_dataset".
 
-gov_url = 'https://www.mass.gov/info-details/covid-19-cases-quarantine-and-monitoring'
-
-# Will attempt to use mount_path by default (if deployed on a Docker container for bind mount). Otherwise, save data locally.
-mount_path = '/opt/covid19_public_data_map/'
-
-# Will attempt to use git path by default (if bind mounting to a local git repository to be later git pushed to a master branch for automation).
-git_path = '/opt/data/seed_covid19__by_city_ma.csv'
-age_git_path = '/opt/data/seed_covid19__by_age_ma.csv'
-
+import os
 import io
 import requests
 import urllib
@@ -20,247 +13,312 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
 import re
-from docx2csv import extract_tables
-import warnings
-from pdfminer.converter import TextConverter
-from pdfminer.pdfinterp import PDFPageInterpreter
-from pdfminer.pdfinterp import PDFResourceManager
-from pdfminer.pdfpage import PDFPage
+import datetime
+from google.cloud import bigquery
+from Levenshtein import distance
+import math
+from collections import defaultdict
+from pyarrow.lib import ArrowTypeError
 
-# Some helper functions
-def decode_table(tables):
+###########################
+# Parameters
+###########################
 
-    table = tables[0]
-    res = []
-    for row in table:
-        processed_row = [x.decode('utf-8').replace(' ', '') for x in row]
-        res.append(processed_row)
+gov_url = 'https://www.mass.gov/info-details/covid-19-cases-quarantine-and-monitoring'
 
-    return res
+tolerable_levenshtein_ratio = 0.1 # Allow 1 word mismatch per 10 words when matching up target file/sheet names w/ actual file/sheet names, since mass.gov can have typo's or idiosyncrasies like that.
+verbose = 2 # verbosity. Recommend set to min. 1. For debugging, set to 2.
 
+col_chars_underscore_list = [' ', '/', '-']
+col_chars_eliminate_list = ['(', ')', '*', '.', '=']
 
-def extract_text_from_pdf(pdf_path):
+min_number_ratio_convert = 0.5 # ratio of minimum number format cells in a column for the entire column to be forcefully cast as numeric. This is to avoid data type issue during data upload to BQ.
 
-    resource_manager = PDFResourceManager()
-    fake_file_handle = io.StringIO()
-    converter = TextConverter(resource_manager, fake_file_handle)
-    page_interpreter = PDFPageInterpreter(resource_manager, converter)
-    
-    with open(pdf_path, 'rb') as fh:
-        for page in PDFPage.get_pages(fh, 
-                                      caching=True,
-                                      check_extractable=True):
-            page_interpreter.process_page(page)
-            
-        text = fake_file_handle.getvalue()
-    
-    # close open handles
-    converter.close()
-    fake_file_handle.close()
-    
-    if text:
-        return text
+download_folder = '/opt/covid19_public_data_map' # Change this depending on your Docker container setup
+upload_bq_project = 'your_bigquery_project_id' # Change this to your BigQuery project ID.
+upload_bq_dataset = 'covid19__staging_data'
+
+total_upload_attempts = 5
+
+job_config = bigquery.LoadJobConfig()
+job_config.write_disposition = bigquery.job.WriteDisposition.WRITE_TRUNCATE
 
 
-def extract_nums(string):
+###########################
+# Helper Functions
+###########################
 
-    res_list = []
-    num_holder = ''
-    for index, num in enumerate(string):
-        if ',' in num_holder[-3:]:
-            num_holder += num
-            continue
-        elif len(num_holder) >= 3 and num != ',':
-            res_list.append(num_holder.replace(',',''))
-            num_holder=num
-        elif num == ',':
-            num_holder += num
-        else:
-            num_holder+=num
-    res_list.append(num_holder.replace(',',''))
-    
-    return res_list
+def process_cols(df):
+    for col in df.columns:
+        renamed_col = col
+        if re.search('^\d', col):
+            renamed_col = f'_{renamed_col}'
 
+        if '100000' in col and '1000000' not in col:
+            renamed_col = col.replace('100000', '100k')
 
-def construct_age_df_from_text(text):
+        for char in col_chars_underscore_list:
+            renamed_col = renamed_col.replace(char, '_')
 
-    age_section_str = re.search(r'Confirmed\s?Cases\s?by\s?Age.*Average\s?age\s?of', text, re.IGNORECASE).group()
+        for char in col_chars_eliminate_list:
+            renamed_col = renamed_col.replace(char, '')
 
-    ages_raw = re.search(r'0-[^a-z]*\+', age_section_str).group().replace(' ', '')
-    ages = re.findall('(\d\d?-\d{2}|\d+\+)', ages_raw)
+        if renamed_col != col:
+            df.rename(columns={col: renamed_col}, inplace=True)
 
-    age_cases_str = re.search(r'\+[^(A-Z)]*', age_section_str, re.IGNORECASE).group()[1:].replace(' ','')
-
-    age_cases = extract_nums(age_cases_str)
-    if len(age_cases) != len(ages):
-        warnings.warn(f'ages & age_cases do not match!\nages: {ages}\age_cases: {age_cases}')
+    return df
 
 
-    age_rates_raw = re.search(r'rate per 100,000.*[^a-z]', age_section_str, re.IGNORECASE).group()
-    age_rates_raw = re.search(r'\+[^a-z]+', age_rates_raw, re.IGNORECASE).group()[1:].replace(' ', '')
-    age_rates = extract_nums(age_rates_raw)
+def levenshtein_dist_ok(str_1,
+                        str_2,
+                        tolerable_levenshtein_ratio = tolerable_levenshtein_ratio):
 
-    if len(age_rates) != len(ages):
-        warnings.warn(f'ages & age_rates do not match!\nages: {ages}\nage_rates: {age_rates}')
+    processed_str_1 = str_1.lower().replace(' ', '')
+    processed_str_2 = str_2.lower().replace(' ', '')
 
-    age_df = pd.DataFrame({'Age_Group': ages,
-                           'Cases': age_cases,
-                           'Per_1M_pp': age_rates})
-
-    age_df['Cases'] = age_df['Cases'].astype(int).astype('Int64')
-    age_df['Per_1M_pp'] = age_df['Per_1M_pp'].astype(int).astype('Int64')
-    age_df['Per_1M_pp'] = age_df['Per_1M_pp'] * 10
-    
-    return age_df
+    return distance(processed_str_1, processed_str_2) <= math.ceil(len(str_1) * tolerable_levenshtein_ratio)
 
 
-def main():
+def count_float_ratio(col):
+    counter = 0
+    for cell in col:
+        if isinstance(cell, float):
+            counter += 1
+    float_ratio = round(counter / len(col), 2)
+    return float_ratio
+
+def count_int_ratio(col):
+    counter = 0
+    for cell in col:
+        if isinstance(cell, int):
+            counter += 1
+    int_ratio = round(counter / len(col), 2)
+    return int_ratio
+
+
+###########################
+# Main.py
+###########################
+
+def main(tolerable_levenshtein_ratio = tolerable_levenshtein_ratio,
+         verbose = verbose):
+    global total_upload_attempts
+
     opener=urllib.request.build_opener()
     opener.addheaders=[('User-Agent','Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36')]
     urllib.request.install_opener(opener)
 
+    bq_client = bigquery.Client()
+
     res = requests.get(gov_url)
     soup = BeautifulSoup(res.text, 'html.parser')
 
-    suffix_link = soup.find('a', text=re.compile(r'Doc', re.IGNORECASE))['href']
-    download_link = f'https://www.mass.gov{suffix_link}'
-    filename = re.search(r'([^-]*-[^-]*-[^-]*)-[^-]*/download', download_link).group(1)
-    filename = filename.replace('-', '_')
+    # try:
+    daily_raw_files_suffix = soup.find('a', text=re.compile(f"^COVID-?19\s?Raw\s?Data.*", re.IGNORECASE))
 
-    docx_mount_filepath = f'{mount_path}{filename}.docx'
-    docx_filepath = f'downloaded/{filename}.docx'
+    # today_B_str = datetime.date.today().strftime('%B')
+    yesterday_B_str = (datetime.date.today() - datetime.timedelta(days=1)).strftime('%B')
 
-    try:
-        urllib.request.urlretrieve(download_link, docx_mount_filepath)
-        print(f'Downloaded from {download_link} to {docx_mount_filepath}!')
-    except FileNotFoundError:
-        print(f'{docx_mount_filepath} does not exist! Save locally instead as {docx_filepath}!')
-        urllib.request.urlretrieve(download_link, docx_filepath)
-        
-    # fetch all tables
-    tables = extract_tables(docx_filepath)
+    today_d_str = int(datetime.date.today().strftime('%d'))
+    yesterday_d_str = int((datetime.date.today() - datetime.timedelta(days=1)).strftime('%d'))
 
-    # pre-process the table embedded in the .docx file
-    table = decode_table(tables)
+    tgt_B_str = re.search('([\w]*)\s?[\d]{1,2},?\s?\d{4}', daily_raw_files_suffix.text).group(1)
+    tgt_d_str = re.search('[\w]*\s?([\d]{1,2}),?\s?\d{4}', daily_raw_files_suffix.text).group(1)
 
-    # Process the table from .docx
-    df = pd.DataFrame(table[1:], columns=table[0])
+    if int(tgt_d_str) == today_d_str: # if days of the month match, ignore month match as it's almost impossible to have month mismatch in that case
+        if verbose >= 1:
+            print(f"O -- Found today's COVID-19 dashboard raw data: {daily_raw_files_suffix.text}")
+        daily_raw_files_filename = f"daily_dashboard__{datetime.date.today().strftime('%Y_%m_%d')}"
 
-    df.rename(columns=lambda x: re.sub(r'.*city.*', 'City_Town', x, flags=re.I),
-              inplace=True)
-    df.rename(columns=lambda x: re.sub(r'.*count.*', 'Count', x, flags=re.I),
-              inplace=True)
-    df.rename(columns=lambda x: re.sub(r'rate.*', 'Per_1M_pp', x, flags=re.I),
-              inplace=True)
+    elif int(tgt_d_str) == yesterday_d_str: # Same, ignore month match
+        if verbose >= 1:
+            print(f"| -- Found yesterday's COVID-19 dashboard raw data: {daily_raw_files_suffix.text}")
+        daily_raw_files_filename = f"daily_dashboard__{(datetime.date.today() - datetime.timedelta(days=1)).strftime('%Y_%m_%d')}"
 
-    df.loc[df['Count'] == '<5', 'Count'] = 1
-    df['Count'] = df['Count'].astype(int)
-    df.loc[df['Per_1M_pp'] == '*', 'Per_1M_pp']  = np.NaN
-    df['Per_1M_pp'] = df['Per_1M_pp'].astype(float)
-    # The original data employ the unit of "cases per 100k people", I found "cases per million" more useful. A bit of idiosyncrasy.
-    df['Per_1M_pp'] = round(df['Per_1M_pp'] * 10, 0)
-    # Int64 (in quotes, capital I) will ignore floating points when loading to BigQuery
-    df['Per_1M_pp'] = df['Per_1M_pp'].astype("Int64")
+    else:
+        if verbose >= 1:
+            print(f"| -- Found older than yesterday's COVID-19 dashboard raw data: {daily_raw_files_suffix.text}")
+        tgt_B_str_numeric_str = datetime.datetime.strftime(datetime.datetime.strptime(tgt_B_str, '%B'), '%m')
+        tgt_d_str_padded = datetime.datetime.strftime(datetime.datetime.strptime(tgt_d_str, '%d'), '%d')
+        daily_raw_files_filename = f"daily_dashboard__{(datetime.date.today() - datetime.timedelta(days=1)).strftime('%Y')}_{tgt_B_str_numeric_str}_{tgt_d_str_padded}"
 
-    # Town name conventions vary. Standardize.
-    correction_dict = {"EastBridgewater": "East Bridgewater",
-        "EastBrookfield": "East Brookfield",
-        "EastLongmeadow": "East Longmeadow",
-        "FallRiver": "Fall River",
-        "GreatBarrington": "Great Barrington",
-        "MountWashington": "Mount Washington",
-        "NewAshford": "New Ashford",
-        "NewBedford": "New Bedford",
-        "NewBraintree": "New Braintree",
-        "NewMarlborough": "New Marlborough",
-        "NewSalem": "New Salem",
-        "NorthAdams": "North Adams",
-        "NorthAndover": "North Andover",
-        "NorthAttleborough": "North Attleborough",
-        "NorthBrookfield": "North Brookfield",
-        "NorthReading": "North Reading",
-        "OakBluffs": "Oak Bluffs",
-        "SouthHadley": "South Hadley",
-        "WestBoylston": "West Boylston",
-        "WestBridgewater": "West Bridgewater",
-        "WestBrookfield": "West Brookfield",
-        "WestNewbury": "West Newbury",
-        "WestSpringfield": "West Springfield",
-        "WestStockbridge": "West Stockbridge",
-        "WestTisbury": "West Tisbury"}
+    # TODO: Compare to log
 
-    for k, v in correction_dict.items():
-        df.loc[df['City_Town'] == k, 'City_Town'] = v
+    daily_raw_file_download_link = f"https://www.mass.gov{daily_raw_files_suffix['href']}"
 
-    # Save the table (known COVID19 cases per city/town) locally
-    df.to_csv(f'processed/{filename}.csv',
-              index=False)
+    daily_raw_file_name = f'{download_folder}/unzipped/{daily_raw_files_filename}.xlsx'
 
-    print(f'{filename}.csv saved locally!')
+    urllib.request.urlretrieve(daily_raw_file_download_link, f'{download_folder}/unzipped/{daily_raw_files_filename}.xlsx')
 
+    # From Census as of 2019-1: https://censusreporter.org/data/table/?table=B01001&geo_ids=04000US25,01000US&primary_geo_id=04000US25#valueType|estimate
+    # TODO: This doesn't line up exactly w/ the calculated results of Mass.gov. Perhaps to refine the number later.
 
-    csv_mount_path = f'{mount_path}{filename}.csv'
+    daily_tab_to_bq_relation_dict = {
+        'HospBedAvailable-Regional': 'Regional_Bed_Availability',
+        'HospBed-Hospital COVID Census': 'Hospital_COVID_Census',
+        'Hospitalization from Hospitals': 'Hospitalization_from_Hospitals',
+        'LTC Facilities': 'LTC_Facilities',
+        'TestingByDate (Test Date)': 'TestingByDate',
+        'AgeLast2Weeks': 'AgeLast2Weeks',
+        'CountyDeaths': 'CountyDeathsLast2Weeks',
+        'County_Weekly': 'County_Weekly'
+        }
+
+    daily_tab_status_dict = defaultdict(int)
+
+    # Build a dictionary that maps the actual file names to template filenames, w/ the two following rules:
+    # 1. Ignore spaces as they can be replaced /w underscore and who knows what.
+    # 2. Make levenshtein distance comparison case-insensitive.
+
+    daily_excel_file = pd.ExcelFile(daily_raw_file_name)
     
-    # save it to the bind mount path
-    try:
-        df.to_csv(csv_mount_path,
-                  index=False)
-    except FileNotFoundError:
-        print(f'{csv_mount_path} not found! Bypassing.')
+    for index, act_tab in enumerate(daily_excel_file.sheet_names):
+        for tgt_tab, bq_relation in daily_tab_to_bq_relation_dict.items():
+            if levenshtein_dist_ok(act_tab, tgt_tab):
+                if act_tab != tgt_tab and verbose >= 1:
+                    print(f'| -- A slight mismatch between actual tab name of {act_tab} & target tab name of {tgt_tab}.')
 
-    # save it to the git path
-    try:
-        df.to_csv(git_path,
-                  index=False)
-    except FileNotFoundError:
-        print(f'{git_path} not found! Bypassing.')
+                try:
+                    df = daily_excel_file.parse(index)
 
-    
-    # ============================================================
+                    # process the dataframe
+                    df = process_cols(df)
 
-    # Download the daily dashboard, in PDF format
-    dashboard_download_link_suffix = soup.find('a', text=re.compile(r'COVID-19 Dashboard - .*', re.IGNORECASE))['href']
-    dashboard_download_link = f'https://www.mass.gov{dashboard_download_link_suffix}'
+                    for col in df.columns:
+                        if count_float_ratio(df[col]) >= 0.5:
+                            df[col] = pd.to_numeric(df[col], errors = 'coerce')
+                        if count_int_ratio(df[col]) >= 0.5:
+                            df[col] = pd.to_numeric(df[col], errors = 'coerce')
 
-    dashboard_filename = 'dashboard_' + re.search(r'[^-]*-[\d]{1,2}-[\d]{4}', dashboard_download_link_suffix).group()
-    dashboard_filename = dashboard_filename.replace('-', '_')
-    age_filename = dashboard_filename.replace('dashboard', 'age')
-    dashboard_pdf_mount_filepath = f'{mount_path}{dashboard_filename}.pdf'
-    dashboard_pdf_filepath = f'downloaded/{dashboard_filename}.pdf'
+                except Exception as e:
+                    daily_tab_status_dict[tgt_tab] = 0
+                    print(f'X -- Unable to process or load the tab {act_tab} as {bq_relation} due to {e}.')
 
-    try:
-        urllib.request.urlretrieve(dashboard_download_link, dashboard_pdf_mount_filepath)
-    except FileNotFoundError:
-        print(f'{dashboard_pdf_mount_filepath} not found! Save the dashboard PDF locally instead!')
-        urllib.request.urlretrieve(dashboard_download_link, dashboard_pdf_filepath)
 
-    dashboard_text = extract_text_from_pdf(dashboard_pdf_filepath)
+                bq_destination = f'{upload_bq_project}.{upload_bq_dataset}.{bq_relation}'
 
-    age_df = construct_age_df_from_text(text=dashboard_text)
+                for attempt in range(1, total_upload_attempts+1):
+                    try:
+                        # Load table synchronously to allow more robust error detection
+                        bq_client.load_table_from_dataframe(df,
+                                                            destination = bq_destination,
+                                                            job_config = job_config).result()
 
-    # save it locally
-    age_df.to_csv(f'processed/{age_filename}.csv',
-                  index=False)
+                        daily_tab_status_dict[tgt_tab] = 1
+                    
+                    except ArrowTypeError as e:
+                        daily_tab_status_dict[tgt_tab] = 0
+                        if re.search('Expected a bytes object, got a \'int\' object', str(e)):
+                            col_name = re.search('failed for column (.*) with type', str(e)).group(1)
+                            print(f'| -- Casting column {col_name} as type string before retry upload!')
+                            df[col_name] = df[col_name].astype(str)
+                    
+                    else:
+                        if attempt == total_upload_attempts:
+                            print(f'X -- Unable to process or load the tab {act_tab} as {bq_relation} due to {e}.')
+                        else:
+                            if verbose >= 2:
+                                print(f"O -- Uploaded act_tab: {act_tab} | df.shape: {df.shape} | bq_destination: {bq_destination} | attempt(s): {attempt}.")
+                        break
+
+    if verbose >= 1:
+        if sum(daily_tab_status_dict.values()) == len(daily_tab_to_bq_relation_dict):
+            print(f'O -- Successfully loaded all required daily files!')
+        else:
+            print(f'X -- Failed uploading some daily files:')
+            for table, val in daily_tab_status_dict.items():
+                if val == 0:
+                    print(table)
 
     
-    age_csv_mount_path = f'{mount_path}{age_filename}.csv'
+    
+    # Process weekly file
+    weekly_raw_files_suffix = soup.find('a', text=re.compile(f"^Weekly.*Raw\s?Data.*", re.IGNORECASE))
 
-    # try save it to the bind mount path
-    try:
-        age_df.to_csv(age_csv_mount_path,
-                      index=False)
-    except FileNotFoundError:
-        print(f'{age_csv_mount_path} not found! Bypassing.')
+    avail_weekly_date = int(re.search('[\w]*\s?([\d]{1,2}),?\s?\d{4}', weekly_raw_files_suffix.text).group(1))
 
-    # try save it to the git repository path
-    try:
-        age_df.to_csv(age_git_path,
-                      index=False)
-        print(f'{age_git_path} updated, to be git pushed to master!')
+    # TODO: compare to log.
 
-    except FileNotFoundError:
-        print(f'{age_git_path} not found! Bypassing.')
+    weekly_raw_files_download_link = f"https://www.mass.gov{weekly_raw_files_suffix['href']}"
+
+    weekly_raw_files_filename = f"weekly_dashboard__{datetime.date.today().strftime('%Y_%m')}_{avail_weekly_date}"
+
+
+    # Looks like this is an Excel file for now. But can change?
+    urllib.request.urlretrieve(weekly_raw_files_download_link, f'{download_folder}/unzipped/{weekly_raw_files_filename}.xlsx')
+
+    weekly_excel_file = pd.ExcelFile(f'{download_folder}/unzipped/{weekly_raw_files_filename}.xlsx')
+
+    weekly_tab_to_bq_relation_dict = {
+        'LTCF': 'LTCF',
+        'ALR': 'ALR'
+        }
+
+    weekly_tab_status_dict = defaultdict(int)
+    
+    # TODO: convert 100000 to 100K, or 1M
+    for index, act_tab in enumerate(weekly_excel_file.sheet_names):
+        for tgt_tab, bq_relation in weekly_tab_to_bq_relation_dict.items():
+            if levenshtein_dist_ok(act_tab, tgt_tab):
+                match_found = True
+
+                if tgt_tab != act_tab and verbose >= 1:
+                    print(f"| -- A slight mismatch between the intended sheet name of  {sheet_name}  &  actual sheet name of {actual_sheet_name}")
+
+                try:
+                    df = weekly_excel_file.parse(act_tab)
+
+                    # Process the dataframe
+                    df = process_cols(df)
+
+                    for col in df.columns:
+                        if count_float_ratio(df[col]) >= 0.5:
+                            df[col] = pd.to_numeric(df[col], errors = 'coerce')
+                        if count_int_ratio(df[col]) >= 0.5:
+                            df[col] = pd.to_numeric(df[col], errors = 'coerce')
+
+                except Exception as e:
+                    weekly_tab_status_dict[tgt_tab] = 0
+                    print(f'X -- Unable to process the tab {act_tab} as {bq_relation} due to {e}.')
+                    continue
+
+                bq_destination = f'{upload_bq_project}.{upload_bq_dataset}.{bq_relation}'
+
+                for attempt in range(1, total_upload_attempts+1):
+                    try:
+                        # Load table synchronously to allow more robust error detection
+                        bq_client.load_table_from_dataframe(df,
+                                                            destination = bq_destination,
+                                                            job_config = job_config).result()
+
+                        weekly_tab_status_dict[tgt_tab] = 1
+
+                    except ArrowTypeError as e:
+                        weekly_tab_status_dict[tgt_tab] = 0
+                        if re.search('Expected a bytes object, got a \'int\' object', str(e)):
+                            col_name = re.search('failed for column (.*) with type', str(e)).group(1)
+                            print(f'| -- Casting column {col_name} as type string before retry upload!')
+                            df[col_name] = df[col_name].astype(str)
+                    
+                    else:
+                        if attempt == total_upload_attempts:
+                            print(f'X -- Unable to process or load the tab {act_tab} as {bq_relation} due to {e}.')
+                        else:
+                            if verbose >= 2:
+                                print(f"O -- Uploaded act_tab: {act_tab} | df.shape: {df.shape} | bq_destination: {bq_destination} | attempt(s): {attempt}.")
+                        break
+
+    if verbose >= 1:
+        if sum(weekly_tab_status_dict.values()) == len(weekly_tab_to_bq_relation_dict):
+            print(f'O -- Successfully loaded all required weekly files!')
+        else:
+            print(f'X -- Failed uploading some weekly files:')
+            for table, val in weekly_tab_status_dict.items():
+                if val == 0:
+                    print(table)
+
+    if verbose >= 1:
+        print(f'O -- Successfully loaded all required weekly files!')
 
 if __name__ == '__main__':
     main()
-
